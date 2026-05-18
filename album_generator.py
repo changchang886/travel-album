@@ -4,12 +4,15 @@
 Creates a beautifully laid-out photo album PDF from selected photos.
 """
 
+import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
 from fpdf import FPDF
+from openai import OpenAI
 
 
 class AlbumGenerator:
@@ -23,6 +26,8 @@ class AlbumGenerator:
         self.pdf = FPDF("P", "mm", "A4")
         self.page_count = 0
         self._setup_fonts()
+        self._setup_ai()
+        self._story_cache = {}  # Cache AI stories to avoid redundant API calls
 
     def _setup_fonts(self):
         """Add Chinese-capable fonts"""
@@ -44,6 +49,10 @@ class AlbumGenerator:
         """Generate the complete album"""
         self.pdf.set_auto_page_break(False)  # Manual page management for layouts
         self.output_path = output_path
+        self.album_title = title
+
+        # Pre-generate all stories for the photos
+        self._generate_stories(photos, title)
 
         # Page 1: Cover
         self._add_cover(title, len(photos))
@@ -141,14 +150,27 @@ class AlbumGenerator:
             self.pdf.set_x(x)
             self.pdf.cell(photo_w, 8, name[:25], align="C")
 
-        # Travel tip or AI-generated story at bottom
+        # AI-generated story at bottom
         y_bottom = y_top + photo_h + 30
         if y_bottom < h - 25:
-            self.pdf.set_y(y_bottom + 10)
-            self.pdf.set_font("CN", "", 9)
-            self.pdf.set_text_color(120, 120, 120)
+            # Combine stories from both photos
+            stories = []
+            for p in photos:
+                story = self._story_cache.get(str(p), "")
+                if story:
+                    stories.append(story)
+            combined = "  |  ".join(stories) if stories else "Travel memory captured"
+            
+            # Story box
+            self.pdf.set_y(y_bottom + 8)
+            self.pdf.set_fill_color(248, 250, 252)
+            self.pdf.set_draw_color(226, 232, 240)
             self.pdf.set_x(m)
-            self.pdf.cell(usable_w, 8, "📍 Travel memory captured", align="C")
+            
+            # Calculate story height
+            self.pdf.set_font("CN", "", 9)
+            self.pdf.set_text_color(80, 80, 80)
+            self.pdf.multi_cell(usable_w, 6, combined, align="C", fill=True)
 
     def _layout_one_photo(self, photo_path, w, h, m):
         """Single large photo layout"""
@@ -187,15 +209,93 @@ class AlbumGenerator:
     def _photo_caption(self, path: Path) -> str:
         """Generate a simple caption from filename"""
         name = path.stem
-        # Remove common prefixes
         for prefix in ["IMG_", "DSC_", "DSC0", "PANO_", "VID_"]:
             if name.startswith(prefix):
                 name = name[len(prefix):]
-        # Remove common suffixes
         for suffix in ["_COVER", "_THUMB", "_original"]:
             if name.endswith(suffix):
                 name = name[:-len(suffix)]
         return name[:30] if name else path.name[:30]
+
+    def _setup_ai(self):
+        """Initialize AI client for story generation"""
+        self.ai_client = None
+        api_key = os.environ.get("DEEPSEEK_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        
+        if not api_key:
+            config_path = Path.home() / "ai-chat-loop" / "config.yaml"
+            if config_path.exists():
+                try:
+                    import yaml
+                    with open(config_path) as f:
+                        cfg = yaml.safe_load(f)
+                    api_key = cfg.get("deepseek", {}).get("api_key", "")
+                except Exception:
+                    pass
+        
+        if api_key:
+            self.ai_client = OpenAI(api_key=api_key, base_url=base_url)
+            self.ai_model = model
+
+    def _generate_stories(self, photos: List[Path], album_title: str):
+        """Generate AI travel stories for all photos"""
+        if not self.ai_client:
+            print("   💡 No AI key configured, skipping story generation")
+            return
+        
+        print("   ✍️  AI writing travel stories...")
+        
+        # Generate in batches of 5 to avoid huge prompts
+        batch_size = 5
+        for i in range(0, len(photos), batch_size):
+            batch = photos[i:i + batch_size]
+            
+            desc_list = []
+            for idx, p in enumerate(batch):
+                global_idx = i + idx + 1
+                # Get basic file info
+                stat = p.stat()
+                date_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d")
+                desc_list.append(f"[Photo {global_idx}] {p.stem[:30]} (taken around {date_str})")
+            
+            prompt = f"""You are writing captions for a travel photo album titled "{album_title}".
+
+For each photo below, write a SHORT (12-18 words) warm, personal caption in Chinese.
+Make it feel like a real travel memory - specific, sensory, emotional.
+NOT generic or AI-sounding. Like a friend writing in a photo album.
+
+Photos:
+{chr(10).join(desc_list)}
+
+Reply ONLY with a JSON object mapping photo index to caption:
+{{"1": "caption for photo 1", "2": "caption for photo 2"}}"""
+
+            try:
+                response = self.ai_client.chat.completions.create(
+                    model=self.ai_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=300,
+                    temperature=0.8,
+                )
+                text = response.choices[0].message.content.strip()
+                
+                # Parse JSON response
+                json_match = re.search(r'\{[^}]+\}', text.replace('\n', ' '))
+                if json_match:
+                    captions = json.loads(json_match.group())
+                    for photo_idx_str, caption in captions.items():
+                        try:
+                            idx = int(photo_idx_str) - 1
+                            if 0 <= idx < len(photos):
+                                self._story_cache[str(photos[idx])] = caption.strip()
+                        except ValueError:
+                            pass
+                
+                print(f"   ✓ Stories generated for photos {i+1}-{min(i+batch_size, len(photos))}")
+            except Exception as e:
+                print(f"   ⚠️ Story generation failed: {e}")
 
     def _add_back_cover(self, title: str):
         """Add a back cover page"""
